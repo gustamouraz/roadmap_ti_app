@@ -1,0 +1,1553 @@
+from __future__ import annotations
+
+import hashlib
+import json
+import sqlite3
+from datetime import date, datetime
+from io import BytesIO
+from pathlib import Path
+from typing import Any
+
+import pandas as pd
+import plotly.express as px
+import plotly.graph_objects as go
+from reportlab.lib import colors
+from reportlab.lib.pagesizes import A4, landscape
+from reportlab.lib.units import mm
+from reportlab.platypus import SimpleDocTemplate, Spacer, Table, TableStyle, Paragraph
+from reportlab.lib.styles import getSampleStyleSheet
+import streamlit as st
+import streamlit.components.v1 as components
+
+
+BASE_DIR = Path(__file__).resolve().parent
+DATA_DIR = BASE_DIR / "data"
+DATA_FILE = DATA_DIR / "projects.json"
+DB_FILE = DATA_DIR / "roadmap.db"
+
+STATUS_COLORS = {
+    "Em andamento": "#9BC3E6",
+    "Concluido": "#8FD06C",
+    "Previsto": "#FFF48A",
+}
+
+STATUS_LABELS = {
+    "Todos": "Todos",
+    "Em andamento": "Andamento",
+    "Concluido": "Concluido",
+    "Previsto": "Previsto",
+}
+
+SETORES = ["Infraestrutura", "Sistemas"]
+IMPORT_COLUMNS = ["descricao", "setor", "demandante", "status", "inicio", "final"]
+
+
+def get_connection() -> sqlite3.Connection:
+    conn = sqlite3.connect(DB_FILE)
+    conn.row_factory = sqlite3.Row
+    return conn
+
+
+def hash_password(password: str) -> str:
+    return hashlib.sha256(password.encode("utf-8")).hexdigest()
+
+
+def init_database() -> None:
+    DATA_DIR.mkdir(parents=True, exist_ok=True)
+    conn = get_connection()
+    cursor = conn.cursor()
+    cursor.execute(
+        """
+        CREATE TABLE IF NOT EXISTS projects (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            descricao TEXT NOT NULL,
+            setor TEXT NOT NULL,
+            demandante TEXT NOT NULL,
+            status TEXT NOT NULL,
+            inicio TEXT NOT NULL,
+            final TEXT NOT NULL
+        )
+        """
+    )
+    cursor.execute(
+        """
+        CREATE TABLE IF NOT EXISTS users (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            username TEXT NOT NULL UNIQUE,
+            full_name TEXT NOT NULL,
+            password_hash TEXT NOT NULL,
+            role TEXT NOT NULL DEFAULT 'admin',
+            active INTEGER NOT NULL DEFAULT 1
+        )
+        """
+    )
+    cursor.execute(
+        """
+        CREATE TABLE IF NOT EXISTS audit_log (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            entity_type TEXT NOT NULL,
+            entity_id INTEGER NOT NULL,
+            action TEXT NOT NULL,
+            actor_username TEXT NOT NULL,
+            details TEXT NOT NULL,
+            created_at TEXT NOT NULL
+        )
+        """
+    )
+    conn.commit()
+
+    project_count = cursor.execute("SELECT COUNT(*) AS total FROM projects").fetchone()["total"]
+    if project_count == 0:
+        seed_projects = load_seed_projects()
+        cursor.executemany(
+            """
+            INSERT INTO projects (descricao, setor, demandante, status, inicio, final)
+            VALUES (:descricao, :setor, :demandante, :status, :inicio, :final)
+            """,
+            seed_projects,
+        )
+
+    user_count = cursor.execute("SELECT COUNT(*) AS total FROM users").fetchone()["total"]
+    if user_count == 0:
+        cursor.execute(
+            """
+            INSERT INTO users (username, full_name, password_hash, role, active)
+            VALUES (?, ?, ?, ?, ?)
+            """,
+            ("admin", "Administrador", hash_password("admin123"), "admin", 1),
+        )
+    conn.commit()
+    conn.close()
+
+
+def ensure_data_file() -> None:
+    DATA_DIR.mkdir(parents=True, exist_ok=True)
+    if not DATA_FILE.exists():
+        DATA_FILE.write_text(
+            json.dumps(DEFAULT_PROJECTS, ensure_ascii=False, indent=2),
+            encoding="utf-8",
+        )
+
+
+def load_seed_projects() -> list[dict[str, Any]]:
+    ensure_data_file()
+    return json.loads(DATA_FILE.read_text(encoding="utf-8"))
+
+
+def load_projects() -> list[dict[str, Any]]:
+    conn = get_connection()
+    rows = conn.execute(
+        """
+        SELECT id, descricao, setor, demandante, status, inicio, final
+        FROM projects
+        ORDER BY date(inicio), date(final), descricao
+        """
+    ).fetchall()
+    conn.close()
+    return [dict(row) for row in rows]
+
+
+def replace_projects(import_rows: list[dict[str, Any]]) -> None:
+    conn = get_connection()
+    conn.execute("DELETE FROM projects")
+    conn.execute("DELETE FROM audit_log WHERE entity_type = 'project'")
+    conn.executemany(
+        """
+        INSERT INTO projects (descricao, setor, demandante, status, inicio, final)
+        VALUES (:descricao, :setor, :demandante, :status, :inicio, :final)
+        """,
+        import_rows,
+    )
+    conn.commit()
+    conn.close()
+    log_audit("project", 0, "bulk_replace", {"total_importado": len(import_rows)})
+
+
+def append_projects(import_rows: list[dict[str, Any]]) -> None:
+    conn = get_connection()
+    conn.executemany(
+        """
+        INSERT INTO projects (descricao, setor, demandante, status, inicio, final)
+        VALUES (:descricao, :setor, :demandante, :status, :inicio, :final)
+        """,
+        import_rows,
+    )
+    conn.commit()
+    conn.close()
+    log_audit("project", 0, "bulk_append", {"total_importado": len(import_rows)})
+
+
+def normalize_import_dataframe(df: pd.DataFrame) -> list[dict[str, Any]]:
+    df.columns = [str(col).strip().lower() for col in df.columns]
+    missing = [col for col in IMPORT_COLUMNS if col not in df.columns]
+    if missing:
+        raise ValueError(f"Colunas obrigatorias ausentes: {', '.join(missing)}")
+
+    work_df = df[IMPORT_COLUMNS].copy()
+    for col in ["descricao", "setor", "demandante", "status"]:
+        work_df[col] = work_df[col].astype(str).str.strip()
+
+    work_df["setor"] = work_df["setor"].replace("", pd.NA).fillna("Sistemas")
+    work_df["status"] = work_df["status"].replace("", pd.NA).fillna("Previsto")
+    work_df["inicio"] = pd.to_datetime(work_df["inicio"], errors="coerce")
+    work_df["final"] = pd.to_datetime(work_df["final"], errors="coerce")
+
+    if work_df["descricao"].eq("").any():
+        raise ValueError("Existem linhas sem descricao.")
+    if work_df["demandante"].eq("").any():
+        raise ValueError("Existem linhas sem demandante.")
+    if work_df["inicio"].isna().any() or work_df["final"].isna().any():
+        raise ValueError("Existem datas invalidas nas colunas inicio/final.")
+    if (work_df["final"] < work_df["inicio"]).any():
+        raise ValueError("Existem linhas com data final menor que a data inicial.")
+
+    invalid_setor = sorted(set(work_df.loc[~work_df["setor"].isin(SETORES), "setor"].tolist()))
+    if invalid_setor:
+        raise ValueError(f"Setores invalidos: {', '.join(invalid_setor)}")
+
+    invalid_status = sorted(set(work_df.loc[~work_df["status"].isin(STATUS_COLORS.keys()), "status"].tolist()))
+    if invalid_status:
+        raise ValueError(f"Status invalidos: {', '.join(invalid_status)}")
+
+    work_df["inicio"] = work_df["inicio"].dt.date.astype(str)
+    work_df["final"] = work_df["final"].dt.date.astype(str)
+    return work_df.to_dict("records")
+
+
+def read_import_file(uploaded_file: Any) -> pd.DataFrame:
+    suffix = Path(uploaded_file.name).suffix.lower()
+    if suffix == ".csv":
+        return pd.read_csv(uploaded_file)
+    if suffix in {".xlsx", ".xls"}:
+        return pd.read_excel(uploaded_file)
+    raise ValueError("Arquivo invalido. Use CSV ou Excel.")
+
+
+def authenticate_user(username: str, password: str) -> dict[str, Any] | None:
+    conn = get_connection()
+    row = conn.execute(
+        """
+        SELECT id, username, full_name, role, active, password_hash
+        FROM users
+        WHERE username = ?
+        """,
+        (username.strip(),),
+    ).fetchone()
+    conn.close()
+    if row is None or row["active"] != 1:
+        return None
+    if row["password_hash"] != hash_password(password):
+        return None
+    return {
+        "id": row["id"],
+        "username": row["username"],
+        "full_name": row["full_name"],
+        "role": row["role"],
+    }
+
+
+def get_current_user() -> dict[str, Any] | None:
+    return st.session_state.get("authenticated_user")
+
+
+def is_admin() -> bool:
+    user = get_current_user()
+    return bool(user and user.get("role") == "admin")
+
+
+def log_audit(entity_type: str, entity_id: int, action: str, details: dict[str, Any]) -> None:
+    user = get_current_user()
+    actor = user["username"] if user else "system"
+    conn = get_connection()
+    conn.execute(
+        """
+        INSERT INTO audit_log (entity_type, entity_id, action, actor_username, details, created_at)
+        VALUES (?, ?, ?, ?, ?, ?)
+        """,
+        (
+            entity_type,
+            entity_id,
+            action,
+            actor,
+            json.dumps(details, ensure_ascii=False),
+            datetime.now().isoformat(timespec="seconds"),
+        ),
+    )
+    conn.commit()
+    conn.close()
+
+
+def list_users() -> list[dict[str, Any]]:
+    conn = get_connection()
+    rows = conn.execute(
+        """
+        SELECT id, username, full_name, role, active
+        FROM users
+        ORDER BY full_name, username
+        """
+    ).fetchall()
+    conn.close()
+    return [dict(row) for row in rows]
+
+
+def create_user(username: str, full_name: str, password: str, role: str, active: bool) -> None:
+    conn = get_connection()
+    cursor = conn.execute(
+        """
+        INSERT INTO users (username, full_name, password_hash, role, active)
+        VALUES (?, ?, ?, ?, ?)
+        """,
+        (username.strip(), full_name.strip(), hash_password(password), role, 1 if active else 0),
+    )
+    conn.commit()
+    user_id = cursor.lastrowid
+    conn.close()
+    log_audit(
+        "user",
+        user_id,
+        "create",
+        {"username": username.strip(), "full_name": full_name.strip(), "role": role, "active": active},
+    )
+
+
+def update_user(user_id: int, full_name: str, role: str, active: bool, password: str | None = None) -> None:
+    conn = get_connection()
+    if password:
+        conn.execute(
+            """
+            UPDATE users
+            SET full_name = ?, role = ?, active = ?, password_hash = ?
+            WHERE id = ?
+            """,
+            (full_name.strip(), role, 1 if active else 0, hash_password(password), user_id),
+        )
+    else:
+        conn.execute(
+            """
+            UPDATE users
+            SET full_name = ?, role = ?, active = ?
+            WHERE id = ?
+            """,
+            (full_name.strip(), role, 1 if active else 0, user_id),
+        )
+    conn.commit()
+    conn.close()
+    log_audit(
+        "user",
+        user_id,
+        "update",
+        {"full_name": full_name.strip(), "role": role, "active": active, "password_changed": bool(password)},
+    )
+
+
+def delete_user(user_id: int) -> None:
+    conn = get_connection()
+    row = conn.execute("SELECT username FROM users WHERE id = ?", (user_id,)).fetchone()
+    conn.execute("DELETE FROM users WHERE id = ?", (user_id,))
+    conn.commit()
+    conn.close()
+    log_audit("user", user_id, "delete", {"username": row["username"] if row else ""})
+
+
+def load_project_history(project_id: int) -> list[dict[str, Any]]:
+    conn = get_connection()
+    rows = conn.execute(
+        """
+        SELECT id, action, actor_username, details, created_at
+        FROM audit_log
+        WHERE entity_type = 'project' AND entity_id = ?
+        ORDER BY datetime(created_at) DESC, id DESC
+        """,
+        (project_id,),
+    ).fetchall()
+    conn.close()
+    history = []
+    for row in rows:
+        item = dict(row)
+        try:
+            item["details"] = json.loads(item["details"])
+        except json.JSONDecodeError:
+            item["details"] = {"raw": item["details"]}
+        history.append(item)
+    return history
+
+
+def parse_projects(projects: list[dict[str, Any]]) -> pd.DataFrame:
+    df = pd.DataFrame(projects)
+    if df.empty:
+        return pd.DataFrame(
+            columns=["id", "descricao", "setor", "demandante", "status", "inicio", "final"]
+        )
+
+    df["inicio"] = pd.to_datetime(df["inicio"]).dt.date
+    df["final"] = pd.to_datetime(df["final"]).dt.date
+    df["dias"] = (pd.to_datetime(df["final"]) - pd.to_datetime(df["inicio"])).dt.days + 1
+    df = df.sort_values(["inicio", "final", "descricao"]).reset_index(drop=True)
+    return df
+
+
+def add_project(projects: list[dict[str, Any]], payload: dict[str, Any]) -> None:
+    conn = get_connection()
+    cursor = conn.execute(
+        """
+        INSERT INTO projects (descricao, setor, demandante, status, inicio, final)
+        VALUES (:descricao, :setor, :demandante, :status, :inicio, :final)
+        """,
+        payload,
+    )
+    conn.commit()
+    project_id = cursor.lastrowid
+    conn.close()
+    log_audit("project", project_id, "create", payload)
+
+
+def update_project(projects: list[dict[str, Any]], project_id: int, payload: dict[str, Any]) -> None:
+    update_payload = payload.copy()
+    update_payload["id"] = project_id
+    conn = get_connection()
+    conn.execute(
+        """
+        UPDATE projects
+        SET descricao = :descricao,
+            setor = :setor,
+            demandante = :demandante,
+            status = :status,
+            inicio = :inicio,
+            final = :final
+        WHERE id = :id
+        """,
+        update_payload,
+    )
+    conn.commit()
+    conn.close()
+    log_audit("project", project_id, "update", payload)
+
+
+def delete_project(projects: list[dict[str, Any]], project_id: int) -> None:
+    conn = get_connection()
+    row = conn.execute("SELECT descricao FROM projects WHERE id = ?", (project_id,)).fetchone()
+    conn.execute("DELETE FROM projects WHERE id = ?", (project_id,))
+    conn.commit()
+    conn.close()
+    log_audit("project", project_id, "delete", {"descricao": row["descricao"] if row else ""})
+
+
+def build_timeline(df: pd.DataFrame) -> go.Figure:
+    timeline_df = df.copy()
+    timeline_df["inicio"] = pd.to_datetime(timeline_df["inicio"])
+    timeline_df["final"] = pd.to_datetime(timeline_df["final"])
+    timeline_df["rotulo_y"] = timeline_df.apply(
+        lambda row: (
+            f'{row["descricao"]} | {row["demandante"]} | {row["setor"]}'
+        ),
+        axis=1,
+    )
+    fig = px.timeline(
+        timeline_df,
+        x_start="inicio",
+        x_end="final",
+        y="rotulo_y",
+        color="status",
+        color_discrete_map=STATUS_COLORS,
+        custom_data=["setor", "demandante", "dias"],
+    )
+    fig.update_traces(
+        hovertemplate=(
+            "<b>%{y}</b><br>"
+            "Setor: %{customdata[0]}<br>"
+            "Demandante: %{customdata[1]}<br>"
+            "Dias: %{customdata[2]}<br>"
+            "Inicio: %{base|%d/%m/%Y}<br>"
+            "Final: %{x|%d/%m/%Y}<extra></extra>"
+        )
+    )
+    fig.update_yaxes(
+        autorange="reversed",
+        title="Projetos",
+        automargin=True,
+        tickfont=dict(size=13, color="#243847"),
+        title_font=dict(size=18, color="#1B2F3C"),
+    )
+    fig.update_xaxes(
+        tickformat="%b/%y",
+        dtick="M1",
+        showgrid=True,
+        gridcolor="#DCE3EA",
+        title="Periodo",
+        tickfont=dict(size=13, color="#243847"),
+        title_font=dict(size=18, color="#1B2F3C"),
+        automargin=True,
+        tickangle=-35,
+    )
+    fig.update_layout(
+        height=max(760, len(timeline_df) * 42 + 200),
+        margin=dict(l=260, r=30, t=40, b=90),
+        plot_bgcolor="#FFFFFF",
+        paper_bgcolor="#FFFFFF",
+        legend_title_text="Status",
+        font=dict(size=15, color="#243847"),
+        legend=dict(font=dict(size=15, color="#243847")),
+    )
+
+    today = pd.Timestamp(date.today())
+    fig.add_vline(x=today, line_width=2, line_color="#D95C4A")
+    fig.add_annotation(
+        x=today,
+        y=1.08,
+        yref="paper",
+        text="Hoje",
+        showarrow=False,
+        font=dict(color="#D95C4A", size=12),
+    )
+    return fig
+
+
+def timeline_html(fig: go.Figure) -> str:
+    return fig.to_html(
+        full_html=False,
+        include_plotlyjs="cdn",
+        config={
+            "displaylogo": False,
+            "responsive": True,
+            "scrollZoom": True,
+            "modeBarButtonsToAdd": ["zoomIn2d", "zoomOut2d", "resetScale2d"],
+        },
+        post_script="""
+        (function() {
+          const gd = document.querySelector('.js-plotly-plot');
+          if (!gd) return;
+          let adaptiveTickMode = null;
+          let relayoutTimer = null;
+
+          function formatWeekOfMonthLabel(value) {
+            const d = new Date(value);
+            if (Number.isNaN(d.getTime())) return null;
+            const day = d.getDate();
+            const weekOfMonth = Math.floor((day - 1) / 7) + 1;
+            const months = ['jan', 'fev', 'mar', 'abr', 'mai', 'jun', 'jul', 'ago', 'set', 'out', 'nov', 'dez'];
+            return `Semana ${weekOfMonth}<br>${months[d.getMonth()]}`;
+          }
+
+          function relayoutIfChanged(update, nextMode) {
+            if (adaptiveTickMode === nextMode) return;
+            adaptiveTickMode = nextMode;
+            Plotly.relayout(gd, update);
+          }
+
+          function applyAdaptiveTicks() {
+            const xaxis = gd._fullLayout && gd._fullLayout.xaxis;
+            if (!xaxis || !xaxis.range) return;
+
+            const start = new Date(xaxis.range[0]);
+            const end = new Date(xaxis.range[1]);
+            if (Number.isNaN(start.getTime()) || Number.isNaN(end.getTime())) return;
+
+            const spanDays = Math.max(1, (end - start) / 86400000);
+
+            if (spanDays <= 120) {
+              const ticks = [];
+              const labels = [];
+              const cursor = new Date(start);
+              cursor.setHours(0, 0, 0, 0);
+              while (cursor <= end) {
+                ticks.push(new Date(cursor));
+                labels.push(formatWeekOfMonthLabel(cursor));
+                cursor.setDate(cursor.getDate() + 7);
+              }
+              relayoutIfChanged(
+                {
+                  'xaxis.tickmode': 'array',
+                  'xaxis.tickvals': ticks,
+                  'xaxis.ticktext': labels,
+                  'xaxis.dtick': null,
+                  'xaxis.tickformat': null,
+                },
+                'weekly'
+              );
+            } else if (spanDays <= 730) {
+              relayoutIfChanged(
+                {
+                  'xaxis.tickmode': 'auto',
+                  'xaxis.tickvals': null,
+                  'xaxis.ticktext': null,
+                  'xaxis.dtick': 'M1',
+                  'xaxis.tickformat': '%b/%Y',
+                },
+                'monthly'
+              );
+            } else {
+              relayoutIfChanged(
+                {
+                  'xaxis.tickmode': 'auto',
+                  'xaxis.tickvals': null,
+                  'xaxis.ticktext': null,
+                  'xaxis.dtick': 'M12',
+                  'xaxis.tickformat': '%Y',
+                },
+                'yearly'
+              );
+            }
+          }
+
+          function scheduleAdaptiveTicks() {
+            if (relayoutTimer) {
+              clearTimeout(relayoutTimer);
+            }
+            relayoutTimer = setTimeout(() => {
+              relayoutTimer = null;
+              applyAdaptiveTicks();
+            }, 120);
+          }
+
+          gd.on('plotly_afterplot', scheduleAdaptiveTicks);
+          gd.on('plotly_relayout', scheduleAdaptiveTicks);
+          setTimeout(scheduleAdaptiveTicks, 60);
+        })();
+        """,
+    )
+
+
+def apply_theme() -> None:
+    st.markdown(
+        """
+        <style>
+            .stApp {
+                background: linear-gradient(180deg, #F7FAFD 0%, #FFFFFF 42%);
+            }
+            .block-container {
+                padding-top: 1.4rem;
+                padding-bottom: 2rem;
+                max-width: 1500px;
+            }
+            .hero {
+                border: 1px solid #D9E3EC;
+                background: #FFFFFF;
+                padding: 1rem 1.2rem 0.9rem 1.2rem;
+                border-radius: 14px;
+                box-shadow: 0 12px 26px rgba(24, 51, 77, 0.07);
+                margin-bottom: 1rem;
+            }
+            .hero h1 {
+                color: #000000;
+                font-size: 2.35rem;
+                margin: 0;
+            }
+            .hero p {
+                color: #445D6D;
+                margin: 0.3rem 0 0 0;
+                font-size: 1.05rem;
+            }
+            .filter-row {
+                display: flex;
+                gap: 0.7rem;
+                margin: 0.8rem 0 1rem 0;
+                flex-wrap: wrap;
+            }
+            .legend-chip {
+                border-radius: 10px;
+                padding: 0.6rem 0.9rem;
+                min-width: 130px;
+                font-weight: 700;
+                color: #1C3442;
+                border: 1px solid rgba(36, 64, 80, 0.08);
+                text-align: center;
+            }
+            .summary-card {
+                border: 1px solid #D9E3EC;
+                background: #FFFFFF;
+                border-radius: 14px;
+                box-shadow: 0 12px 26px rgba(24, 51, 77, 0.05);
+                padding: 1rem 1.1rem;
+            }
+            .summary-label {
+                color: #566C7B;
+                font-size: 0.9rem;
+                font-weight: 600;
+            }
+            .summary-value {
+                color: #183241;
+                font-size: 2rem;
+                font-weight: 800;
+                line-height: 1.1;
+                margin-top: 0.2rem;
+            }
+            .table-card, .chart-card {
+                border: 1px solid #D9E3EC;
+                background: #FFFFFF;
+                border-radius: 14px;
+                box-shadow: 0 12px 26px rgba(24, 51, 77, 0.05);
+                padding: 0.9rem;
+            }
+            div[data-testid="stDialog"] [role="dialog"] {
+                max-width: 900px;
+                width: min(900px, 92vw);
+            }
+            .section-note {
+                color: #546A79;
+                font-size: 0.95rem;
+                margin-bottom: 0.6rem;
+            }
+            .history-title {
+                color: #000000;
+                font-size: 1.25rem;
+                font-weight: 700;
+                margin-bottom: 0.75rem;
+            }
+            h1, h2, h3, h4, h5, h6 {
+                color: #000000 !important;
+            }
+            div[data-testid="stMarkdownContainer"] h1,
+            div[data-testid="stMarkdownContainer"] h2,
+            div[data-testid="stMarkdownContainer"] h3,
+            div[data-testid="stMarkdownContainer"] h4,
+            div[data-testid="stMarkdownContainer"] h5,
+            div[data-testid="stMarkdownContainer"] h6 {
+                color: #000000 !important;
+            }
+            div[data-testid="stSidebar"] h1,
+            div[data-testid="stSidebar"] h2,
+            div[data-testid="stSidebar"] h3,
+            div[data-testid="stSidebar"] h4,
+            div[data-testid="stSidebar"] h5,
+            div[data-testid="stSidebar"] h6 {
+                color: #000000 !important;
+            }
+        </style>
+        """,
+        unsafe_allow_html=True,
+    )
+
+
+def init_state() -> None:
+    if "status_filter" not in st.session_state:
+        st.session_state.status_filter = "Todos"
+    if "sector_filter" not in st.session_state:
+        st.session_state.sector_filter = "Todos"
+    if "period_start" not in st.session_state:
+        st.session_state.period_start = date(2025, 12, 1)
+    if "period_end" not in st.session_state:
+        st.session_state.period_end = date(2026, 6, 30)
+    if "editing_project_id" not in st.session_state:
+        st.session_state.editing_project_id = None
+    if "show_new_dialog" not in st.session_state:
+        st.session_state.show_new_dialog = False
+    if "authenticated_user" not in st.session_state:
+        st.session_state.authenticated_user = None
+    if "show_user_dialog" not in st.session_state:
+        st.session_state.show_user_dialog = False
+    if "editing_user_id" not in st.session_state:
+        st.session_state.editing_user_id = None
+
+
+def export_projects_excel(df: pd.DataFrame) -> bytes:
+    export_df = df.copy()
+    export_df["inicio"] = pd.to_datetime(export_df["inicio"]).dt.strftime("%d/%m/%Y")
+    export_df["final"] = pd.to_datetime(export_df["final"]).dt.strftime("%d/%m/%Y")
+    export_df = export_df.rename(
+        columns={
+            "descricao": "Descricao",
+            "setor": "Setor",
+            "demandante": "Demandante",
+            "status": "Status",
+            "inicio": "Inicio",
+            "final": "Final",
+            "dias": "Dias",
+        }
+    )
+    buffer = BytesIO()
+    with pd.ExcelWriter(buffer, engine="openpyxl") as writer:
+        export_df[
+            ["Descricao", "Setor", "Demandante", "Status", "Inicio", "Final", "Dias"]
+        ].to_excel(writer, index=False, sheet_name="Projetos")
+    buffer.seek(0)
+    return buffer.getvalue()
+
+
+def export_import_template() -> bytes:
+    template_df = pd.DataFrame(
+        [
+            {
+                "descricao": "Exemplo de projeto",
+                "setor": "Sistemas",
+                "demandante": "Financeiro",
+                "status": "Em andamento",
+                "inicio": "2026-04-01",
+                "final": "2026-04-30",
+            }
+        ],
+        columns=IMPORT_COLUMNS,
+    )
+    buffer = BytesIO()
+    with pd.ExcelWriter(buffer, engine="openpyxl") as writer:
+        template_df.to_excel(writer, index=False, sheet_name="Modelo")
+    buffer.seek(0)
+    return buffer.getvalue()
+
+
+def export_projects_pdf(df: pd.DataFrame) -> bytes:
+    export_df = df.copy()
+    export_df["inicio"] = pd.to_datetime(export_df["inicio"]).dt.strftime("%d/%m/%Y")
+    export_df["final"] = pd.to_datetime(export_df["final"]).dt.strftime("%d/%m/%Y")
+
+    buffer = BytesIO()
+    doc = SimpleDocTemplate(
+        buffer,
+        pagesize=landscape(A4),
+        leftMargin=8 * mm,
+        rightMargin=8 * mm,
+        topMargin=10 * mm,
+        bottomMargin=10 * mm,
+    )
+    styles = getSampleStyleSheet()
+    title = Paragraph("Roadmap TI - Exportacao de Projetos", styles["Title"])
+    generated = Paragraph(
+        f"Gerado em {datetime.now().strftime('%d/%m/%Y %H:%M')}",
+        styles["Normal"],
+    )
+
+    rows = [["Descricao", "Setor", "Demandante", "Status", "Inicio", "Final", "Dias"]]
+    for _, row in export_df.iterrows():
+        rows.append(
+            [
+                str(row["descricao"]),
+                str(row["setor"]),
+                str(row["demandante"]),
+                str(row["status"]),
+                str(row["inicio"]),
+                str(row["final"]),
+                str(row["dias"]),
+            ]
+        )
+
+    table = Table(rows, repeatRows=1, colWidths=[78 * mm, 30 * mm, 35 * mm, 28 * mm, 24 * mm, 24 * mm, 16 * mm])
+    table.setStyle(
+        TableStyle(
+            [
+                ("BACKGROUND", (0, 0), (-1, 0), colors.HexColor("#183241")),
+                ("TEXTCOLOR", (0, 0), (-1, 0), colors.white),
+                ("GRID", (0, 0), (-1, -1), 0.4, colors.HexColor("#D9E3EC")),
+                ("FONTNAME", (0, 0), (-1, 0), "Helvetica-Bold"),
+                ("FONTSIZE", (0, 0), (-1, -1), 8),
+                ("ROWBACKGROUNDS", (0, 1), (-1, -1), [colors.white, colors.HexColor("#F7FAFD")]),
+                ("VALIGN", (0, 0), (-1, -1), "MIDDLE"),
+            ]
+        )
+    )
+    doc.build([title, Spacer(1, 4 * mm), generated, Spacer(1, 5 * mm), table])
+    buffer.seek(0)
+    return buffer.getvalue()
+
+
+def render_exports(df: pd.DataFrame) -> None:
+    if df.empty:
+        return
+    excel_bytes = export_projects_excel(df)
+    pdf_bytes = export_projects_pdf(df)
+    col1, col2 = st.columns(2)
+    col1.download_button(
+        "Exportar Excel",
+        data=excel_bytes,
+        file_name=f"roadmap_projetos_{date.today().isoformat()}.xlsx",
+        mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+        use_container_width=True,
+    )
+    col2.download_button(
+        "Exportar PDF",
+        data=pdf_bytes,
+        file_name=f"roadmap_projetos_{date.today().isoformat()}.pdf",
+        mime="application/pdf",
+        use_container_width=True,
+    )
+
+
+def render_login() -> None:
+    st.markdown(
+        """
+        <div class="hero">
+            <h1>Roadmap TI</h1>
+            <p>Acesso restrito ao gerenciamento e visualizacao do cronograma.</p>
+        </div>
+        """,
+        unsafe_allow_html=True,
+    )
+    center_left, center_mid, center_right = st.columns([1, 1.1, 1])
+    with center_mid:
+        with st.container(border=True):
+            st.subheader("Login")
+            username = st.text_input("Usuario")
+            password = st.text_input("Senha", type="password")
+            if st.button("Entrar", type="primary", use_container_width=True):
+                user = authenticate_user(username, password)
+                if user is None:
+                    st.error("Usuario ou senha invalidos.")
+                else:
+                    st.session_state.authenticated_user = user
+                    st.rerun()
+            st.caption("Usuario padrao: admin | Senha padrao: admin123")
+
+
+def project_payload_from_form(
+    descricao: str,
+    setor: str,
+    demandante: str,
+    status: str,
+    inicio: date,
+    final: date,
+) -> dict[str, Any]:
+    return {
+        "descricao": descricao.strip(),
+        "setor": setor.strip() or "Nao informado",
+        "demandante": demandante.strip() or "Nao informado",
+        "status": status,
+        "inicio": inicio.isoformat(),
+        "final": final.isoformat(),
+    }
+
+
+@st.dialog("Projeto", width="large")
+def project_dialog(projects: list[dict[str, Any]], project_id: int | None = None) -> None:
+    current = None
+    if project_id is not None:
+        current = next(item for item in projects if item["id"] == project_id)
+    can_edit = is_admin()
+
+    st.markdown(
+        '<div class="section-note">Preencha os dados do projeto neste card centralizado.</div>',
+        unsafe_allow_html=True,
+    )
+    if not can_edit:
+        st.info("Perfil visualizador: a consulta esta liberada, mas alteracoes nao sao permitidas.")
+    descricao = st.text_input("Descricao", value="" if current is None else current["descricao"], disabled=not can_edit)
+    col1, col2 = st.columns(2)
+    setor_default = "Sistemas" if current is None else current["setor"]
+    setor = col1.selectbox(
+        "Setor",
+        options=SETORES,
+        index=SETORES.index(setor_default) if setor_default in SETORES else SETORES.index("Sistemas"),
+        disabled=not can_edit,
+    )
+    demandante = col2.text_input("Demandante", value="" if current is None else current["demandante"], disabled=not can_edit)
+    col3, col4, col5 = st.columns([1, 1, 1.1])
+    status = col3.selectbox(
+        "Status",
+        options=list(STATUS_COLORS.keys()),
+        index=0 if current is None else list(STATUS_COLORS.keys()).index(current["status"]),
+        disabled=not can_edit,
+    )
+    inicio = col4.date_input(
+        "Inicio",
+        value=date.today() if current is None else datetime.fromisoformat(current["inicio"]).date(),
+        disabled=not can_edit,
+    )
+    final = col5.date_input(
+        "Final",
+        value=date.today() if current is None else datetime.fromisoformat(current["final"]).date(),
+        disabled=not can_edit,
+    )
+
+    col_save, col_delete, col_cancel = st.columns([1, 1, 1])
+    save_label = "Adicionar" if current is None else "Salvar alteracoes"
+    if col_save.button(save_label, use_container_width=True, type="primary", disabled=not can_edit):
+        if not descricao.strip():
+            st.error("Informe a descricao do projeto.")
+            return
+        if final < inicio:
+            st.error("A data final nao pode ser menor que a inicial.")
+            return
+
+        payload = project_payload_from_form(descricao, setor, demandante, status, inicio, final)
+        if current is None:
+            add_project(projects, payload)
+        else:
+            update_project(projects, project_id, payload)
+        st.session_state.show_new_dialog = False
+        st.session_state.editing_project_id = None
+        st.rerun()
+
+    if current is not None and col_delete.button("Excluir", use_container_width=True, disabled=not can_edit):
+        delete_project(projects, project_id)
+        st.session_state.editing_project_id = None
+        st.rerun()
+
+    if col_cancel.button("Cancelar", use_container_width=True):
+        st.session_state.show_new_dialog = False
+        st.session_state.editing_project_id = None
+        st.rerun()
+
+
+def render_status_filters() -> None:
+    status_order = ["Todos", "Em andamento", "Concluido", "Previsto"]
+    selected = st.segmented_control(
+        "Status",
+        options=status_order,
+        format_func=lambda item: STATUS_LABELS[item],
+        default=st.session_state.status_filter,
+        selection_mode="single",
+    )
+    if selected:
+        st.session_state.status_filter = selected
+
+
+def render_sector_filters() -> None:
+    sector_order = ["Todos"] + SETORES
+    selected = st.segmented_control(
+        "Setor",
+        options=sector_order,
+        default=st.session_state.sector_filter,
+        selection_mode="single",
+    )
+    if selected:
+        st.session_state.sector_filter = selected
+
+
+def render_filter_band(show_period: bool) -> None:
+    with st.container(border=True):
+        if show_period:
+            col1, col2, col3, col4 = st.columns([1.05, 1.35, 1, 1], vertical_alignment="bottom")
+            with col1:
+                render_sector_filters()
+            with col2:
+                render_status_filters()
+            st.session_state.period_start = col3.date_input("Periodo inicial", value=st.session_state.period_start)
+            st.session_state.period_end = col4.date_input("Periodo final", value=st.session_state.period_end)
+        else:
+            col1, col2 = st.columns([1, 1], vertical_alignment="bottom")
+            with col1:
+                render_sector_filters()
+            with col2:
+                render_status_filters()
+
+
+def render_summary_cards(total: int, concluidos: int, andamento: int, previstos: int) -> None:
+    cards = [
+        ("Total de projetos", total),
+        ("Concluidos", concluidos),
+        ("Em andamento", andamento),
+        ("Previstos", previstos),
+    ]
+    cols = st.columns(4)
+    for idx, (label, value) in enumerate(cards):
+        cols[idx].markdown(
+            f"""
+            <div class="summary-card">
+                <div class="summary-label">{label}</div>
+                <div class="summary-value">{value}</div>
+            </div>
+            """,
+            unsafe_allow_html=True,
+        )
+
+
+def render_management_page(raw_projects: list[dict[str, Any]], df: pd.DataFrame) -> None:
+    st.subheader("Cadastro de projetos")
+    st.markdown(
+        '<div class="section-note">Use esta pagina para incluir, localizar, alterar e excluir projetos.</div>',
+        unsafe_allow_html=True,
+    )
+
+    top_col1, top_col2 = st.columns([1.5, 0.6])
+    busca = top_col1.text_input("Buscar", placeholder="Descricao ou demandante", key="mgmt_busca")
+    if top_col2.button("Novo projeto", type="primary", use_container_width=True, key="mgmt_novo", disabled=not is_admin()):
+        st.session_state.show_new_dialog = True
+    render_filter_band(show_period=False)
+
+    filtered_df = df.copy()
+    if st.session_state.sector_filter != "Todos":
+        filtered_df = filtered_df[filtered_df["setor"] == st.session_state.sector_filter]
+    if busca.strip():
+        term = busca.strip().lower()
+        filtered_df = filtered_df[
+            filtered_df["descricao"].str.lower().str.contains(term)
+            | filtered_df["demandante"].str.lower().str.contains(term)
+        ]
+
+    total = len(filtered_df)
+    concluidos = int((filtered_df["status"] == "Concluido").sum()) if total else 0
+    andamento = int((filtered_df["status"] == "Em andamento").sum()) if total else 0
+    previstos = int((filtered_df["status"] == "Previsto").sum()) if total else 0
+    render_summary_cards(total, concluidos, andamento, previstos)
+    render_exports(filtered_df)
+
+    with st.container(border=True):
+        st.markdown(
+            '<div class="section-note">Clique em uma linha da tabela para abrir o card de alteracao do projeto.</div>',
+            unsafe_allow_html=True,
+        )
+        if filtered_df.empty:
+            st.info("Nenhum projeto encontrado com os filtros atuais.")
+        else:
+            view_df = filtered_df[
+                ["id", "descricao", "setor", "demandante", "status", "inicio", "final", "dias"]
+            ].rename(
+                columns={
+                    "id": "ID",
+                    "descricao": "Descricao",
+                    "setor": "Setor",
+                    "demandante": "Demandante",
+                    "status": "Status",
+                    "inicio": "Inicio",
+                    "final": "Final",
+                    "dias": "Dias",
+                }
+            )
+            selection = st.dataframe(
+                view_df,
+                use_container_width=True,
+                hide_index=True,
+                height=760,
+                on_select="rerun",
+                selection_mode="single-row",
+                column_config={
+                    "ID": st.column_config.NumberColumn(width="small"),
+                    "Inicio": st.column_config.DateColumn(format="DD/MM/YYYY"),
+                    "Final": st.column_config.DateColumn(format="DD/MM/YYYY"),
+                    "Dias": st.column_config.NumberColumn(format="%d"),
+                },
+            )
+            rows = selection.get("selection", {}).get("rows", [])
+            if rows:
+                selected_idx = rows[0]
+                st.session_state.editing_project_id = int(view_df.iloc[selected_idx]["ID"])
+
+    if is_admin():
+        with st.container(border=True):
+            st.subheader("Importacao de projetos")
+            st.markdown(
+                '<div class="section-note">Importe um arquivo CSV ou Excel com as colunas: descricao, setor, demandante, status, inicio e final.</div>',
+                unsafe_allow_html=True,
+            )
+            st.download_button(
+                "Baixar modelo de importacao",
+                data=export_import_template(),
+                file_name="modelo_importacao_projetos.xlsx",
+                mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+                use_container_width=True,
+            )
+            uploaded_file = st.file_uploader(
+                "Arquivo de importacao",
+                type=["csv", "xlsx", "xls"],
+                key="project_import_file",
+            )
+            mode = st.segmented_control(
+                "Modo de importacao",
+                options=["Anexar", "Substituir base"],
+                default="Anexar",
+                selection_mode="single",
+                key="project_import_mode",
+            )
+            if st.button("Importar projetos", type="primary", use_container_width=True, key="import_projects_btn"):
+                if uploaded_file is None:
+                    st.error("Selecione um arquivo para importar.")
+                else:
+                    try:
+                        import_df = read_import_file(uploaded_file)
+                        import_rows = normalize_import_dataframe(import_df)
+                        if mode == "Substituir base":
+                            replace_projects(import_rows)
+                        else:
+                            append_projects(import_rows)
+                        st.success(f"{len(import_rows)} projetos importados com sucesso.")
+                        st.rerun()
+                    except Exception as exc:
+                        st.error(str(exc))
+
+    if st.session_state.show_new_dialog:
+        project_dialog(raw_projects)
+    if st.session_state.editing_project_id is not None:
+        project_dialog(raw_projects, st.session_state.editing_project_id)
+
+
+def render_timeline_page(df: pd.DataFrame) -> None:
+    st.subheader("Roadmap visual")
+    st.markdown(
+        '<div class="section-note">Pagina dedicada ao grafico Gantt, com filtros de status, setor e periodo.</div>',
+        unsafe_allow_html=True,
+    )
+
+    busca = st.text_input("Buscar", placeholder="Descricao ou demandante", key="timeline_busca")
+    render_filter_band(show_period=True)
+
+    if st.session_state.period_end < st.session_state.period_start:
+        st.error("O periodo final nao pode ser menor que o periodo inicial.")
+        return
+
+    filtered_df = df.copy()
+    if st.session_state.sector_filter != "Todos":
+        filtered_df = filtered_df[filtered_df["setor"] == st.session_state.sector_filter]
+    if st.session_state.status_filter != "Todos":
+        filtered_df = filtered_df[filtered_df["status"] == st.session_state.status_filter]
+    if busca.strip():
+        term = busca.strip().lower()
+        filtered_df = filtered_df[
+            filtered_df["descricao"].str.lower().str.contains(term)
+            | filtered_df["demandante"].str.lower().str.contains(term)
+        ]
+    filtered_df = filtered_df[
+        (filtered_df["inicio"] <= st.session_state.period_end)
+        & (filtered_df["final"] >= st.session_state.period_start)
+    ]
+
+    total = len(filtered_df)
+    concluidos = int((filtered_df["status"] == "Concluido").sum()) if total else 0
+    andamento = int((filtered_df["status"] == "Em andamento").sum()) if total else 0
+    previstos = int((filtered_df["status"] == "Previsto").sum()) if total else 0
+    render_summary_cards(total, concluidos, andamento, previstos)
+    render_exports(filtered_df)
+
+    with st.container(border=True):
+        st.markdown(
+            '<div class="section-note">Cronograma com zoom adaptativo: ate cerca de 4 meses mostra Semana 1, Semana 2, Semana 3 e Semana 4; em visao intermediaria mostra mes/ano; e em visao ampla mostra ano.</div>',
+            unsafe_allow_html=True,
+        )
+        if filtered_df.empty:
+            st.info("Sem dados para montar o cronograma.")
+        else:
+            fig = build_timeline(filtered_df)
+            components.html(
+                timeline_html(fig),
+                height=860,
+                scrolling=True,
+            )
+
+
+@st.dialog("Usuario", width="large")
+def user_dialog(user_id: int | None = None) -> None:
+    users = list_users()
+    current = next((item for item in users if item["id"] == user_id), None)
+    creating = current is None
+
+    username = st.text_input("Usuario", value="" if creating else current["username"], disabled=not creating)
+    col1, col2 = st.columns(2)
+    full_name = col1.text_input("Nome completo", value="" if creating else current["full_name"])
+    role = col2.selectbox(
+        "Perfil",
+        options=["admin", "visualizador"],
+        index=0 if creating else ["admin", "visualizador"].index(current["role"]),
+    )
+    active = st.toggle("Usuario ativo", value=True if creating else bool(current["active"]))
+    password_label = "Senha" if creating else "Nova senha"
+    password = st.text_input(password_label, type="password")
+
+    col_save, col_delete, col_cancel = st.columns([1, 1, 1])
+    if col_save.button("Salvar", type="primary", use_container_width=True):
+        if not username.strip() and creating:
+            st.error("Informe o usuario.")
+            return
+        if not full_name.strip():
+            st.error("Informe o nome completo.")
+            return
+        if creating and not password.strip():
+            st.error("Informe a senha inicial.")
+            return
+        try:
+            if creating:
+                create_user(username, full_name, password, role, active)
+            else:
+                update_user(user_id, full_name, role, active, password.strip() or None)
+        except sqlite3.IntegrityError:
+            st.error("Ja existe um usuario com esse login.")
+            return
+        st.session_state.show_user_dialog = False
+        st.session_state.editing_user_id = None
+        st.rerun()
+
+    if not creating and col_delete.button("Excluir", use_container_width=True):
+        if current["username"] == "admin":
+            st.error("O usuario admin padrao nao pode ser excluido.")
+            return
+        delete_user(user_id)
+        st.session_state.show_user_dialog = False
+        st.session_state.editing_user_id = None
+        st.rerun()
+
+    if col_cancel.button("Cancelar", use_container_width=True):
+        st.session_state.show_user_dialog = False
+        st.session_state.editing_user_id = None
+        st.rerun()
+
+
+def render_users_page() -> None:
+    st.subheader("Usuarios")
+    st.markdown(
+        '<div class="section-note">Cadastre usuarios locais, altere perfis e controle quem pode editar ou apenas visualizar.</div>',
+        unsafe_allow_html=True,
+    )
+    if not is_admin():
+        st.warning("Somente administradores podem acessar esta pagina.")
+        return
+
+    col1, col2 = st.columns([1.4, 0.6])
+    user_search = col1.text_input("Buscar usuario", placeholder="Nome ou login", key="user_search")
+    if col2.button("Novo usuario", type="primary", use_container_width=True):
+        st.session_state.show_user_dialog = True
+        st.session_state.editing_user_id = None
+
+    users = pd.DataFrame(list_users())
+    if user_search.strip() and not users.empty:
+        term = user_search.strip().lower()
+        users = users[
+            users["username"].str.lower().str.contains(term)
+            | users["full_name"].str.lower().str.contains(term)
+        ]
+
+    st.markdown('<div class="table-card">', unsafe_allow_html=True)
+    if users.empty:
+        st.info("Nenhum usuario encontrado.")
+    else:
+        users_view = users.rename(
+            columns={
+                "id": "ID",
+                "username": "Usuario",
+                "full_name": "Nome",
+                "role": "Perfil",
+                "active": "Ativo",
+            }
+        )
+        users_view["Ativo"] = users_view["Ativo"].map({1: "Sim", 0: "Nao"})
+        selection = st.dataframe(
+            users_view[["ID", "Usuario", "Nome", "Perfil", "Ativo"]],
+            use_container_width=True,
+            hide_index=True,
+            height=420,
+            on_select="rerun",
+            selection_mode="single-row",
+        )
+        rows = selection.get("selection", {}).get("rows", [])
+        if rows:
+            st.session_state.editing_user_id = int(users_view.iloc[rows[0]]["ID"])
+    st.markdown("</div>", unsafe_allow_html=True)
+
+    if st.session_state.get("show_user_dialog"):
+        user_dialog()
+    if st.session_state.get("editing_user_id") is not None:
+        user_dialog(st.session_state.editing_user_id)
+
+
+def render_project_history(df: pd.DataFrame) -> None:
+    st.subheader("Historico de alteracoes")
+    st.markdown(
+        '<div class="section-note">Consulte as alteracoes registradas por projeto, com data, usuario e detalhes.</div>',
+        unsafe_allow_html=True,
+    )
+    with st.container(border=True):
+        st.markdown('<div class="history-title">Historico de alteracoes</div>', unsafe_allow_html=True)
+        if df.empty:
+            st.info("Sem projetos para consultar historico.")
+            return
+
+        options = {f'{item["id"]} - {item["descricao"]}': item["id"] for item in df.to_dict("records")}
+        selected_label = st.selectbox("Projeto", options=list(options.keys()), key="history_project")
+        project_id = options[selected_label]
+        history = load_project_history(project_id)
+        if not history:
+            st.info("Nao ha historico registrado para este projeto.")
+        else:
+            history_rows = []
+            for item in history:
+                history_rows.append(
+                    {
+                        "Data/Hora": item["created_at"].replace("T", " "),
+                        "Acao": item["action"],
+                        "Usuario": item["actor_username"],
+                        "Detalhes": json.dumps(item["details"], ensure_ascii=False),
+                    }
+                )
+            st.dataframe(pd.DataFrame(history_rows), use_container_width=True, hide_index=True, height=320)
+
+
+DEFAULT_PROJECTS = [
+    {
+        "id": 1,
+        "descricao": "API Planejamento e Controle Orcamentario",
+        "setor": "Sistemas",
+        "demandante": "Processo",
+        "status": "Concluido",
+        "inicio": "2025-12-09",
+        "final": "2026-01-02",
+    },
+    {
+        "id": 2,
+        "descricao": "API Pagamento e Extrato Armazens Gerais",
+        "setor": "Sistemas",
+        "demandante": "Financeiro",
+        "status": "Concluido",
+        "inicio": "2025-12-10",
+        "final": "2026-01-09",
+    },
+    {
+        "id": 3,
+        "descricao": "Protheus Projeto Manutencao de Frotas",
+        "setor": "Sistemas",
+        "demandante": "PCM",
+        "status": "Em andamento",
+        "inicio": "2026-01-07",
+        "final": "2026-04-20",
+    },
+    {
+        "id": 4,
+        "descricao": "Justificativas de Pesagem Manual",
+        "setor": "Sistemas",
+        "demandante": "Processo",
+        "status": "Concluido",
+        "inicio": "2026-01-12",
+        "final": "2026-01-30",
+    },
+    {
+        "id": 5,
+        "descricao": "BI Posicao de Estoque",
+        "setor": "Sistemas",
+        "demandante": "Suprimentos",
+        "status": "Concluido",
+        "inicio": "2026-01-19",
+        "final": "2026-03-13",
+    },
+    {
+        "id": 6,
+        "descricao": "SOC Etapa 2 Treinamento Go Live",
+        "setor": "Sistemas",
+        "demandante": "SSO",
+        "status": "Concluido",
+        "inicio": "2026-01-19",
+        "final": "2026-04-02",
+    },
+    {
+        "id": 7,
+        "descricao": "Padronizacao das Redes Wi-Fi",
+        "setor": "Infraestrutura",
+        "demandante": "Geral",
+        "status": "Concluido",
+        "inicio": "2026-01-21",
+        "final": "2026-01-27",
+    },
+    {
+        "id": 8,
+        "descricao": "Operacao Assistida XR Bank",
+        "setor": "Sistemas",
+        "demandante": "CSC",
+        "status": "Concluido",
+        "inicio": "2026-02-16",
+        "final": "2026-03-27",
+    },
+    {
+        "id": 9,
+        "descricao": "BI Rastreamento de Cargas",
+        "setor": "Sistemas",
+        "demandante": "Comercial",
+        "status": "Em andamento",
+        "inicio": "2026-03-02",
+        "final": "2026-04-20",
+    },
+    {
+        "id": 10,
+        "descricao": "Homologacao de Nova Versao Protheus",
+        "setor": "Sistemas",
+        "demandante": "Masutti Geral",
+        "status": "Em andamento",
+        "inicio": "2026-03-23",
+        "final": "2026-04-24",
+    },
+    {
+        "id": 11,
+        "descricao": "Implementacao Novo Fluxo de Compras",
+        "setor": "Sistemas",
+        "demandante": "Suprimentos",
+        "status": "Em andamento",
+        "inicio": "2026-03-23",
+        "final": "2026-05-01",
+    },
+    {
+        "id": 12,
+        "descricao": "API Solicitacao de Compras",
+        "setor": "Sistemas",
+        "demandante": "CSC",
+        "status": "Em andamento",
+        "inicio": "2026-03-30",
+        "final": "2026-04-24",
+    },
+    {
+        "id": 13,
+        "descricao": "Reforma Casarao",
+        "setor": "Infraestrutura",
+        "demandante": "Fazenda Saudades",
+        "status": "Previsto",
+        "inicio": "2026-04-13",
+        "final": "2026-05-01",
+    },
+    {
+        "id": 14,
+        "descricao": "Rotina de Lancamento Ativo Biologico",
+        "setor": "Sistemas",
+        "demandante": "Controladoria",
+        "status": "Previsto",
+        "inicio": "2026-04-13",
+        "final": "2026-05-08",
+    },
+    {
+        "id": 15,
+        "descricao": "Reforma Fazenda Mustang",
+        "setor": "Infraestrutura",
+        "demandante": "Fazenda Mustang",
+        "status": "Previsto",
+        "inicio": "2026-04-20",
+        "final": "2026-06-30",
+    },
+]
+
+
+def main() -> None:
+    st.set_page_config(
+        page_title="Roadmap TI",
+        layout="wide",
+        initial_sidebar_state="expanded",
+    )
+    apply_theme()
+    init_state()
+    init_database()
+
+    if st.session_state.authenticated_user is None:
+        render_login()
+        return
+
+    raw_projects = load_projects()
+    df = parse_projects(raw_projects)
+
+    st.markdown(
+        """
+        <div class="hero">
+            <h1>Roadmap TI</h1>
+            <p>Sistema de gerenciamento de projetos com tabela operacional e cronograma estilo Gantt.</p>
+        </div>
+        """,
+        unsafe_allow_html=True,
+    )
+    st.sidebar.markdown(
+        f'**Usuario:** {st.session_state.authenticated_user["full_name"]}'
+    )
+    st.sidebar.markdown(
+        f'**Perfil:** {st.session_state.authenticated_user["role"]}'
+    )
+    if st.sidebar.button("Sair", use_container_width=True):
+        st.session_state.authenticated_user = None
+        st.rerun()
+    page_options = ["Projetos", "Grafico", "Historico"]
+    if is_admin():
+        page_options.append("Usuarios")
+    page = st.sidebar.radio("Paginas", options=page_options, index=0)
+    st.sidebar.markdown("Use `Projetos` para cadastro e manutencao.")
+    st.sidebar.markdown("Use `Grafico` para visualizar apenas o roadmap.")
+    st.sidebar.markdown("Use `Historico` para consultar alteracoes registradas.")
+    if is_admin():
+        st.sidebar.markdown("Use `Usuarios` para administrar acessos.")
+
+    if page == "Projetos":
+        render_management_page(raw_projects, df)
+    elif page == "Grafico":
+        render_timeline_page(df)
+    elif page == "Historico":
+        render_project_history(df)
+    else:
+        render_users_page()
+
+
+if __name__ == "__main__":
+    main()
