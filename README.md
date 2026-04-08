@@ -5,7 +5,7 @@ Aplicacao em Python com interface web para gerenciar projetos e visualizar um ro
 ## Recursos
 
 - Cadastro, edicao e exclusao de projetos
-- Persistencia em SQLite
+- Persistencia em banco compativel com deploy via `DATABASE_URL`
 - Login de usuarios locais
 - Perfis `admin` e `visualizador`
 - Historico de alteracoes por projeto
@@ -37,7 +37,26 @@ python -m streamlit run app.py
 
 ## Banco de dados
 
-Na primeira execucao o sistema cria `data/roadmap.db` e importa os projetos iniciais.
+O sistema usa `DATABASE_URL` quando configurada. Isso permite deploy com Postgres em provedores como Neon, Supabase ou similares.
+
+Sem `DATABASE_URL`, o app usa `SQLite` local em `data/roadmap.db` apenas como fallback para ambiente local.
+
+Exemplo de `DATABASE_URL` para Postgres:
+
+```toml
+DATABASE_URL="postgresql://usuario:senha@host:5432/database"
+```
+
+No Streamlit Community Cloud, configure isso em:
+
+- `App settings`
+- `Secrets`
+
+Exemplo de `secrets.toml`:
+
+```toml
+DATABASE_URL="postgresql://usuario:senha@host:5432/database"
+```
 
 ## Login padrao
 
